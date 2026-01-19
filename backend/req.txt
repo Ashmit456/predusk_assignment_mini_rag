@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+cohere
+qdrant-client
+pypdf
+tiktoken
+langchain
+langchain-community
+langchain-core
+langchain-google-genai
+langchain-qdrant
+langchain-huggingface
+sentence-transformers
