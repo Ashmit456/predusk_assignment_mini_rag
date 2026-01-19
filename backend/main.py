@@ -2,43 +2,27 @@ import os
 import shutil
 import time
 import tempfile
+import asyncio
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 import cohere
+from qdrant_client import QdrantClient # Added for manual client connection
 
-# LangChain
+# --- Imports ---
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --------------------------------------------------
-# ENV
-# --------------------------------------------------
+# Load Environment Variables
 load_dotenv()
 
-REQUIRED_VARS = [
-    "GOOGLE_API_KEY",
-    "COHERE_API_KEY",
-    "QDRANT_URL",
-    "QDRANT_API_KEY",
-]
-
-for var in REQUIRED_VARS:
-    if not os.getenv(var):
-        raise RuntimeError(f"Missing environment variable: {var}")
-
-# --------------------------------------------------
-# APP
-# --------------------------------------------------
 app = FastAPI(title="RAG Assessment API", version="1.0")
 
 app.add_middleware(
@@ -49,55 +33,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# HEALTH CHECK (IMPORTANT)
-# --------------------------------------------------
-@app.get("/")
-def health():
-    return {"status": "running"}
-
-# --------------------------------------------------
-# LAZY SINGLETONS (CRITICAL FOR RENDER)
-# --------------------------------------------------
-_embeddings = None
-_llm = None
-_cohere = None
-
-def get_embeddings():
-    global _embeddings
-    if _embeddings is None:
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2"
-        )
-    return _embeddings
-
-def get_llm():
-    global _llm
-    if _llm is None:
-        _llm = ChatGoogleGenerativeAI(
-            model="gemini-flash-latest",
-            temperature=0,
-            max_retries=3,
-        )
-    return _llm
+# --- Clients ---
 
 def get_cohere_client():
-    global _cohere
-    if _cohere is None:
-        _cohere = cohere.Client(os.getenv("COHERE_API_KEY"))
-    return _cohere
+    key = os.getenv("COHERE_API_KEY")
+    if not key:
+        raise ValueError("COHERE_API_KEY missing")
+    return cohere.Client(key)
+
+def get_embeddings():
+    # USES GOOGLE API (Remote, Lightweight, 768 dimensions)
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("GOOGLE_API_KEY missing")
+    return GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+def get_qdrant_client():
+    url = os.getenv("QDRANT_URL")
+    api_key = os.getenv("QDRANT_API_KEY")
+    if not url or not api_key:
+        raise ValueError("QDRANT credentials are missing")
+    return QdrantClient(url=url, api_key=api_key)
 
 def get_vectorstore():
-    return QdrantVectorStore.from_existing_collection(
-        embedding=get_embeddings(),
-        collection_name="rag_assessment_v2",
-        url=os.getenv("QDRANT_URL"),
-        api_key=os.getenv("QDRANT_API_KEY"),
+    # Returns the vectorstore object WITHOUT checking if collection exists yet
+    # This prevents the "Collection not found" crash on startup
+    client = get_qdrant_client()
+    return QdrantVectorStore(
+        client=client,
+        collection_name="rag_google_v4",
+        embedding=get_embeddings()
     )
 
-# --------------------------------------------------
-# MODELS
-# --------------------------------------------------
+def get_llm():
+    return ChatGoogleGenerativeAI(
+        model="gemini-flash-latest", 
+        temperature=0,
+        max_retries=3,
+    )
+
+# --- Data Models ---
+
 class QueryRequest(BaseModel):
     query: str
 
@@ -111,27 +86,23 @@ class QueryResponse(BaseModel):
     citations: List[Citation]
     processing_time: float
 
-# --------------------------------------------------
-# INGEST
-# --------------------------------------------------
+# --- Endpoints ---
+
 @app.post("/ingest")
 async def ingest_document(
-    file: UploadFile = File(None),
-    text: str = Form(None),
+    file: UploadFile = File(None), 
+    text: str = Form(None)
 ):
-    if not file and not text:
-        raise HTTPException(status_code=400, detail="Provide file or text")
-
     temp_path = None
-
     try:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150,
-            add_start_index=True,
-        )
+        if not file and not text:
+            raise HTTPException(status_code=400, detail="Provide file or text.")
 
-        docs = []
+        # Chunking
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=150, add_start_index=True
+        )
+        splits = []
 
         if file:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -140,102 +111,145 @@ async def ingest_document(
 
             loader = PyPDFLoader(temp_path)
             docs = loader.load()
+            splits = text_splitter.split_documents(docs)
+            for split in splits:
+                split.metadata["source"] = file.filename
 
-            for d in docs:
-                d.metadata["source"] = file.filename
-
-            splits = splitter.split_documents(docs)
-
-        else:
-            splits = splitter.create_documents(
-                [text],
-                metadatas=[{"source": "User Input"}],
+        elif text:
+            splits = text_splitter.create_documents(
+                texts=[text], metadatas=[{"source": "User Input"}]
             )
 
+        # Indexing with Smart Creation Logic
         if splits:
-            QdrantVectorStore.from_documents(
-                splits,
-                embedding=get_embeddings(),
-                url=os.getenv("QDRANT_URL"),
-                api_key=os.getenv("QDRANT_API_KEY"),
-                collection_name="rag_assessment_v2",
-                force_recreate=False,
-            )
+            batch_size = 20
+            total_batches = len(splits) // batch_size + 1
+            print(f"Ingesting {len(splits)} chunks in {total_batches} batches...")
 
-        return {"status": "success", "chunks": len(splits)}
+            # We use the generic client to pass config
+            client = get_qdrant_client()
+            embeddings = get_embeddings()
+            
+            for i in range(0, len(splits), batch_size):
+                batch = splits[i:i+batch_size]
+                if not batch: continue
+                
+                try:
+                    # FIX: If it's the very first batch ever, we use from_documents to CREATE the collection
+                    if i == 0:
+                        QdrantVectorStore.from_documents(
+                            batch,
+                            embeddings,
+                            url=os.getenv("QDRANT_URL"),
+                            api_key=os.getenv("QDRANT_API_KEY"),
+                            collection_name="rag_google_v4",
+                            force_recreate=False # Don't delete if it already exists, just append
+                        )
+                    else:
+                        # For subsequent batches, we just add to existing
+                        vectorstore = get_vectorstore()
+                        vectorstore.add_documents(batch)
+                    
+                    # Sleep to respect Google Rate Limits
+                    await asyncio.sleep(1.0) 
+                    
+                except Exception as e:
+                    print(f"Batch {i} failed: {e}")
+                    # Allow one retry
+                    await asyncio.sleep(5)
+                    try:
+                        vectorstore = get_vectorstore()
+                        vectorstore.add_documents(batch)
+                    except Exception as retry_e:
+                        print(f"Retry failed: {retry_e}")
+
+        return {"status": "success", "message": f"Indexed {len(splits)} chunks."}
 
     except Exception as e:
+        print(f"Ingest Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-# --------------------------------------------------
-# CHAT
-# --------------------------------------------------
 @app.post("/chat", response_model=QueryResponse)
 async def chat_endpoint(request: QueryRequest):
-    start = time.time()
-
+    start_time = time.time()
     try:
         vectorstore = get_vectorstore()
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-        docs = retriever.invoke(request.query)
+        
+        # 1. Retrieve
+        try:
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+            initial_docs = retriever.invoke(request.query)
+        except Exception as e:
+            # Handle case where collection doesn't exist yet (Chat before Ingest)
+            print(f"Retrieval failed (likely empty DB): {e}")
+            return {
+                "answer": "Please upload a document first.", 
+                "citations": [], 
+                "processing_time": 0
+            }
+        
+        if not initial_docs:
+            return {
+                "answer": "No information found.", 
+                "citations": [], 
+                "processing_time": 0
+            }
 
-        if not docs:
-            return QueryResponse(
-                answer="No information found",
-                citations=[],
-                processing_time=0,
-            )
-
-        # RERANK
+        # 2. Rerank
+        top_docs = []
         try:
             co = get_cohere_client()
-            rerank = co.rerank(
+            doc_texts = [d.page_content for d in initial_docs]
+            
+            rerank_results = co.rerank(
                 model="rerank-english-v3.0",
                 query=request.query,
-                documents=[d.page_content for d in docs],
-                top_n=3,
+                documents=doc_texts,
+                top_n=3
             )
-            top_docs = [docs[r.index] for r in rerank.results]
-        except Exception:
-            top_docs = docs[:3]
+            
+            for result in rerank_results.results:
+                top_docs.append(initial_docs[result.index])
+        except Exception as e:
+            print(f"Reranking skipped ({e}), utilizing top retrieved docs.")
+            top_docs = initial_docs[:3]
 
-        context = "\n\n".join(d.page_content for d in top_docs)
-
-        prompt = ChatPromptTemplate.from_template(
-            """
-            Answer ONLY from the context.
-            If unknown, say "I cannot answer".
-
-            Context:
-            {context}
-
-            Question:
-            {question}
-            """
-        )
-
+        # 3. Generate
+        context_str = "\n\n".join([d.page_content for d in top_docs])
+        
+        template = """
+        Answer based ONLY on the context below. If unknown, say "I cannot answer".
+        
+        Context:
+        {context}
+        
+        Question: 
+        {question}
+        """
+        
+        prompt = ChatPromptTemplate.from_template(template)
         chain = prompt | get_llm() | StrOutputParser()
-        answer = chain.invoke(
-            {"context": context, "question": request.query}
-        )
-
+        answer_text = chain.invoke({"context": context_str, "question": request.query})
+        
         citations = [
-            Citation(
-                text=d.page_content[:200] + "...",
-                source=d.metadata.get("source", "Unknown"),
-            )
-            for d in top_docs
+            {"text": doc.page_content[:200] + "...", "source": doc.metadata.get("source", "Unknown")} 
+            for doc in top_docs
         ]
 
-        return QueryResponse(
-            answer=answer,
-            citations=citations,
-            processing_time=round(time.time() - start, 2),
-        )
+        return {
+            "answer": answer_text,
+            "citations": citations,
+            "processing_time": round(time.time() - start_time, 2)
+        }
 
     except Exception as e:
+        print(f"Chat Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
